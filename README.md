@@ -1,5 +1,7 @@
 # WaveMo: Learning Wavefront Modulations to See Through Scattering
 ​
+This code base is taken from https://wavemo-2024.github.io/. 
+
 Code for the CVPR 2024 paper "WaveMo: Learning Wavefront Modulations to See Through Scattering".
 <br>[**Project Page**](https://wavemo-2024.github.io/) | [**PDF**](https://openaccess.thecvf.com/content/CVPR2024/papers/Xie_WaveMo_Learning_Wavefront_Modulations_to_See_Through_Scattering_CVPR_2024_paper.pdf) | [**arXiv**](https://arxiv.org/abs/2404.07985) | [**YouTube**](https://www.youtube.com/watch?v=2iP-0nzV6TY) <br>
 
