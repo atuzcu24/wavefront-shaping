@@ -20,6 +20,76 @@ from network.SirenMulti import MultiSiren
 from pathlib import Path
 import torch.optim as optim
 from tqdm import tqdm
+from datetime import datetime
+import pandas as pd
+
+
+
+def evaluate_model(model, test_loader, crop_fn, device, wandb=None, epoch=0, label="Test", 
+                   use_modulation=True, sim=True, dataset='places', 
+                   slm_mode='mlp', slm_alphas=None, zern_net=None, zern_net_basis=None,
+                   zernike_basis=None, mask_batch=None, abe_std_low=1.0, abe_std_high=2.0, 
+                   grid_size=1, nframe=16, zern_order=7):
+    model.eval()
+    mse_loss_fn = torch.nn.MSELoss()
+    test_loss_sum, test_psnr_sum, test_ssim_sum = 0.0, 0.0, 0.0
+    count = 0
+
+    with torch.no_grad():
+        for test_batch in test_loader:
+            if not sim:
+                target, sample = test_batch[0].to(device), test_batch[1].to(device)
+                #print("Target size: ", target.shape)
+                #print("Zernike basis shape: ", zernike_basis.shape)
+                #print("Number of Zernike modes: ", zernike_basis.shape[-1])
+                #print("Weights shape: ", abe_alphas.shape)
+
+            else:
+                if dataset.lower() == 'fashion':
+                    test_batch = test_batch[0]
+                target = test_batch.to(device) 
+                abe_std = torch.FloatTensor(1).uniform_(abe_std_low, abe_std_high).to(device)
+                abe_alphas = abe_std * torch.rand(grid_size**2, (zern_order*(zern_order+1))//2).to(device)
+                
+                
+                #print("Target size: ", target.shape)
+                #print("Zernike basis shape: ", zernike_basis.shape)
+                #print("Number of Zernike modes: ", zernike_basis.shape[-1])
+                #print("Weights shape: ", abe_alphas.shape)
+
+                abe_patterns = generate_zern_patterns(abe_alphas, zernike_basis, device=device)
+                abe_psfs = gen_psf(abe_patterns)
+                y_zero = conv_psf(target, abe_psfs, mask=mask_batch)
+
+                if use_modulation:
+                    if slm_mode.lower() == 'mlp' or slm_mode.lower() == 'dip' or slm_mode.lower() == 'siren':
+                        slm_alphas = zern_net(zern_net_basis).permute(0, 3, 1, 2)
+                    slm_patterns = torch.exp(1j * slm_alphas)
+                    offset = (target.shape[-1] - int(target.shape[-1] / 1920 * 1080)) // 2
+                    slm_patterns = F.pad(slm_patterns[..., offset:-offset, :], (0, 0, offset, offset), "constant", 0)
+                    mod_psfs = gen_psf(slm_patterns.permute(1, 0, 2, 3) * abe_patterns)
+                    y_mod = conv_psf(target, mod_psfs, mask=mask_batch)
+                    sample = torch.cat((y_zero, y_mod), dim=1)
+                else:
+                    sample = y_zero
+
+                recon = model(sample)
+                loss = mse_loss_fn(recon, target)
+                psnr_val = psnr(torch.clamp(crop_fn(recon.detach()), 0, 1), crop_fn(target.detach()))
+                ssim_val = ssim(torch.clamp(crop_fn(recon.detach()), 0, 1), crop_fn(target.detach()))
+
+                test_loss_sum += loss.item()
+                test_psnr_sum += psnr_val.item()
+                test_ssim_sum += ssim_val.item()
+                count += 1
+
+        mean_loss = test_loss_sum / count
+        mean_psnr = test_psnr_sum / count
+        mean_ssim = test_ssim_sum / count
+
+    return mean_loss, mean_psnr, mean_ssim
+
+
 
 
 def wavemo(
@@ -34,11 +104,11 @@ def wavemo(
         save_folder='Test', 
         save_root='output',
         resume_ckpt_path=None, 
-        num_epochs=1, # currently one epoch takes around 12 hours on MIT Places data_large, which appears to be enough.
+        num_epochs=100, # currently one epoch takes around 12 hours on MIT Places data_large, which appears to be enough.
         train_size=1e7, # 1e5 per gpu hour
         nframe = 32,   
         accum_batch = 1, 
-        batch_size = 8,
+        batch_size = 32,
         residual = True, 
         zern_std_tuple = (5, 6),  
         rand_std_tuple = (2., 2.5),
@@ -164,7 +234,6 @@ def wavemo(
     final_lr=1e-6
 
     if sim:
-        num_epochs = 1
         if 'fashion' in dataset:
             num_epochs = 50
     else:
@@ -207,12 +276,30 @@ def wavemo(
     seed_torch(0)
     init_env()
     device = torch.device('cuda') # device for training
+    #print(torch.cuda.get_device_name(0))
+    #print(f"Using device: {device}")
+    #print(f"Device count: {torch.cuda.device_count()}")
+    #print(f"Current device: {torch.cuda.current_device()}")
+    #print(f"Device name: {torch.cuda.get_device_name(torch.cuda.current_device())}")
+
+
     save_dir = os.path.join(root_dir, save_folder)
     num_workers = 0 # when using debugger, num_workers must be 0
 
     if use_wandb:
         try:
-            run = wandb.init(project="WaveMo", name=save_folder, reinit=True, dir=f'{root_dir}/wandb', settings=wandb.Settings(start_method="fork"))
+            run = wandb.init(project="WaveMo", name=f"{save_folder}_{datetime.now().strftime('%Y%m%d_%H%M%S')}", reinit=True, dir=f'{root_dir}/wandb', settings=wandb.Settings(start_method="fork"))
+            print("wandb run initialized:", run.name)
+            wandb.define_metric("epoch")
+            wandb.define_metric("Epoch-Train-Loss", step_metric="epoch")
+            wandb.define_metric("Epoch-Test-Loss", step_metric="epoch")
+            wandb.define_metric("Epoch-Test-PSNR", step_metric="epoch")
+            wandb.define_metric("Epoch-Test-SSIM", step_metric="epoch")
+            wandb.define_metric("Train-PSNR", step_metric="epoch")
+            wandb.define_metric("Train-SSIM", step_metric="epoch")
+            wandb.define_metric("Test-PSNR", step_metric="epoch")
+            wandb.define_metric("Test-SSIM", step_metric="epoch")
+
         except:
             use_wandb = False
         
@@ -304,8 +391,21 @@ def wavemo(
 
     train_inds = img_inds[:int(train_size)]
     test_inds = img_inds[-int(test_size):]
+    #New parts
+    len_data = len(places_dataset)
+    #len_data = 1000 # If want to define the number of images
+
+    img_inds = np.arange(len_data)
+    np.random.shuffle(img_inds)
+
+    split_point = int(0.8 * len_data) 
+    train_inds = img_inds[:split_point]  
+    test_inds = img_inds[split_point:]   
     seed_torch(22)
     np.random.shuffle(train_inds)
+    print("Dataset size:", len_data)
+    print("Train size:", len(train_inds))
+    print("Test size:", len(test_inds))
     if not sim:
         print('Test GT Filenames', itemgetter(*test_inds)(places_dataset.data))
     train_dataset = torch.utils.data.Subset(places_dataset, train_inds)
@@ -483,6 +583,8 @@ def wavemo(
     best_save_model_list = []      
     beginning_time = time.time()
     for epoch in epoch_bar:
+        epoch_loss_sum = 0 #New
+        epoch_batch_count = 0 #New
         model.train()
         epoch_data_visited = 0
         train_bar = tqdm(train_loader, desc='', disable=disable_inner_tqdm or eval_only, position=0, leave=True, dynamic_ncols=True)   
@@ -583,6 +685,7 @@ def wavemo(
 
                 seed_torch(42)
                 if True:
+                    test_loss_sum = 0 #New
                     for test_iter, test_batch in enumerate(test_bar, 1):
                         if True:
                             seed_torch(test_iter+42)
@@ -628,7 +731,19 @@ def wavemo(
                                     sample = y_zero
                                 
                                 recon = model(sample)
+                                test_loss = nn.MSELoss()(recon, target).item()
+                                test_loss_sum += test_loss
+                                random_slm = torch.rand_like(slm_phs)  # <-- random modulation
+                                random_mod_psfs = gen_psf(random_slm.permute(1, 0, 2, 3) * abe_patterns)
+                                random_y_mod = conv_psf(target, random_mod_psfs, mask=mask_batch)
+                                random_sample = torch.cat((y_zero, random_y_mod), dim=1)
+                                random_recon = model(random_sample)
 
+
+                            if count == 0:
+                                test_loss_mean = 0
+                            else:
+                                test_loss_mean = test_loss_sum / count #New
                             test_metrics = psnr(torch.clamp(crop_ROI(recon.detach()), 0, 1), crop_ROI(target.detach())).item()
                             test_metrics_ssim = ssim(torch.clamp(crop_ROI(recon.detach()), 0, 1), crop_ROI(target.detach())).item()
                         
@@ -654,16 +769,39 @@ def wavemo(
                             # log_image(recon[0].unsqueeze(0), 'Test-Recon', f'{epoch_dir_vis}/test_epoch{epoch}_idx{test_iter}_recon', log_wandb=False)
 
                         if test_iter == 1:
+                            for i in range(min(4, target.size(0))):
+                                test_folder = f'{epoch_dir}/TestSet_idx_{i}'
+                                os.makedirs(test_folder, exist_ok=True)
 
-                            test_save_path = save_captioned_imgs(img_list, caption_list=[None, None, None], is_torch_tensor=True, rescale=False, flip=True, grayscale=False, 
-                            save_path=f'{epoch_dir}/TestSet_GT_Measurement_Recon_PSNR_{test_metrics:.4f}.png')
-                            
-                            save_image(target[0].unsqueeze(0).detach().cpu(), f'{epoch_dir}/TestSet_GT.png', normalize=False, scale_each=False)
-                            save_image(recon[0].unsqueeze(0).detach().cpu(), f'{epoch_dir}/TestSet_Recon_PSNR_{test_metrics:.4f}.png', normalize=False, scale_each=False)
+                                imgs = [
+                                    (target[i].unsqueeze(0).detach().cpu(), 'GT.png'),
+                                    (sample[i, 0, ...].unsqueeze(0).detach().cpu(), 'Measurement.png'),
+                                    (recon[i].unsqueeze(0).detach().cpu(), 'Reconstruction.png')
+                                ]
 
+                                for img_tensor, filename in imgs:
+                                    save_path = os.path.join(test_folder, filename)
+                                    save_image(img_tensor, save_path, normalize=True, scale_each=False)
 
-                            if use_wandb:
-                                wandb.log({"TestSet: GT vs. Measurement vs. Recon": wandb.Image(test_save_path)}, step=train_iter)
+                                # --- Save metrics in CSV ---
+                                metrics = {
+                                    "Epoch": [epoch],
+                                    "Iteration": [train_iter],
+                                    "PSNR": [test_metrics],
+                                    "SSIM": [test_metrics_ssim],
+                                    "Loss": [test_loss_mean]  # if you have per-image loss, else use mean
+                                }
+                                df = pd.DataFrame(metrics)
+                                csv_path = os.path.join(test_folder, 'metrics.csv')
+                                df.to_csv(csv_path, index=False)
+
+                                # --- WandB log if needed ---
+                                if use_wandb:
+                                    wandb.log({
+                                        f"Test Example {i} - Reconstruction": wandb.Image(os.path.join(test_folder, 'Reconstruction.png')),
+                                        f"Test Example {i} - PSNR": test_metrics,
+                                        f"Test Example {i} - SSIM": test_metrics_ssim
+                                    }, step=train_iter)
 
                             if sim:
                                 phs_vis_num = max(nframe, 1)  
@@ -940,6 +1078,9 @@ def wavemo(
     
             loss /= accum_batch
             loss.backward()
+            epoch_loss_sum += loss.item()
+            epoch_batch_count += 1
+
             if train_iter % accum_batch == 0:
                 optimizer.step()
                 optimizer.zero_grad()
@@ -954,15 +1095,29 @@ def wavemo(
             epoch_bar.set_description(f"[Epoch {epoch}] Data Visited {epoch_data_visited-batch_size} ===> Train PSNR: {train_metrics:.4f}, Test PSNR: {test_metrics:.4f}, New Abe PSNR: {new_abe_metrics:.4f}")
             epoch_bar.refresh()
             if use_wandb:
-                wandb.log({'Train-PSNR': train_metrics}, step=train_iter)  
-                wandb.log({'Train-SSIM': train_metrics_ssim}, step=train_iter)
+                #wandb.log({'Train-PSNR': train_metrics}, step=train_iter)  
+                #wandb.log({'Train-SSIM': train_metrics_ssim}, step=train_iter)
+                wandb.log({
+                    'epoch': epoch,
+                    'step': train_iter,
+                    'Train-PSNR': train_metrics,
+                    'Train-SSIM': train_metrics_ssim,
+                    'Train-Loss': loss.item()
+                })
+
 
             if not sim and train_iter == 1:
                 img_list = [target[0].unsqueeze(0).detach().cpu(), sample[0, 0, ...].unsqueeze(0).detach().cpu(), recon[0].unsqueeze(0).detach().cpu()]
                 train_save_path = save_captioned_imgs(img_list, caption_list=['truth', 'sample', 'recon'], is_torch_tensor=True, rescale=False, flip=True,
                                         save_path=f'outs/train.png', grayscale=False)
                 if use_wandb:
-                    wandb.log({"Train-Recon": wandb.Image(train_save_path)}, step=train_iter)
+                    wandb.log({
+                        "Train-Recon": wandb.Image(train_save_path),
+                        'epoch': epoch,
+                        'Test-PSNR': test_metrics_mean,
+                        'Test-SSIM': test_metrics_mean_ssim
+                    }, step=train_iter)
+
 
                 del sample, target, recon
                 torch.cuda.empty_cache()
@@ -978,6 +1133,44 @@ def wavemo(
             del sample, target, recon
             torch.cuda.empty_cache()
             gc.collect()
+        
+        
+        """test_loss, test_psnr, test_ssim = evaluate_model(
+            model=model,
+            test_loader=test_loader,
+            crop_fn=crop_ROI,
+            device=device,
+            wandb=wandb if use_wandb else None,
+            epoch=epoch,
+            label='Test',
+            use_modulation=use_modulation,
+            sim=sim,
+            dataset=dataset,
+            slm_mode=slm_mode,
+            slm_alphas=slm_alphas,
+            zern_net=zern_net,
+            zern_net_basis=zern_net_basis,
+            zernike_basis=zernike_basis,
+            mask_batch=mask_batch,
+            abe_std_low=abe_std_low,
+            abe_std_high=abe_std_high,
+            grid_size=grid_size,
+            nframe=nframe,
+            zern_order=zern_order
+        )
+        if use_wandb:
+            wandb.log({
+                'epoch': epoch,
+                'Epoch-Train-Loss': epoch_loss_sum / epoch_batch_count,
+                f'Epoch-Test-Loss': test_loss,
+                f'Epoch-Test-PSNR': test_psnr,
+                f'Epoch-Test-SSIM': test_ssim,
+            })
+        print(f"[Epoch {epoch}] Train Loss: {epoch_loss_sum / epoch_batch_count:.4f} | "
+            f"Test Loss: {test_loss:.4f} | "
+            f"Train PSNR: {train_metrics:.2f} | Test PSNR: {test_psnr:.2f} | "
+            f"Train SSIM: {train_metrics_ssim:.2f} | Test SSIM: {test_ssim:.2f}")"""
+        
 
     if use_wandb:
         run.finish()
